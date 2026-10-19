@@ -1537,7 +1537,7 @@ get_best_name (GtkIconTheme *icon_theme,
         for (i = 0; i != g_strv_length ((gchar **) names); i++) {
             const gchar *name = names[i];
 
-            icon_name = g_strconcat ("xsi-", name, NULL);
+            icon_name = g_strconcat ("", name, NULL);
             if (gtk_icon_theme_has_icon (icon_theme, icon_name)) {
                 break;
             }
@@ -1559,10 +1559,10 @@ get_best_name (GtkIconTheme *icon_theme,
 
         if (g_strcmp0 (type_name, "volume") == 0 ||
             g_strcmp0 (type_name, "drive") == 0) {
-            icon_name = g_strdup ("xsi-drive-removable-media-symbolic");
+            icon_name = g_strdup ("drive-removable-media-symbolic");
         }
         else {
-            icon_name = g_strdup ("xsi-drive-harddisk-symbolic");
+            icon_name = g_strdup ("drive-harddisk-symbolic");
         }
     }
 

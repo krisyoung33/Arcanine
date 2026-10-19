@@ -409,12 +409,42 @@ setup_side_pane_width (NemoWindow *window)
 {
 	g_return_if_fail (window->details->sidebar != NULL);
 
-	window->details->side_pane_width =
-		g_settings_get_int (nemo_window_state,
-				    NEMO_WINDOW_STATE_SIDEBAR_WIDTH);
+	/* Safely lock the minimum width so the sidebar never vanishes */
+	gtk_widget_set_size_request (window->details->sidebar, 180, -1);
 
-	gtk_paned_set_position (GTK_PANED (window->details->content_paned),
-				window->details->side_pane_width);
+	window->details->side_pane_width = g_settings_get_int (nemo_window_state, NEMO_WINDOW_STATE_SIDEBAR_WIDTH);
+
+	if (window->details->side_pane_width < 180) {
+		window->details->side_pane_width = 180;
+	}
+
+	gtk_paned_set_position (GTK_PANED (window->details->content_paned), window->details->side_pane_width);
+}
+
+static gboolean
+reset_downloads_location_idle (gpointer user_data)
+{
+    NemoWindowSlot *slot = NEMO_WINDOW_SLOT (user_data);
+    GFile *downloads = g_file_new_for_path (g_get_user_special_dir (G_USER_DIRECTORY_DOWNLOAD));
+    nemo_window_slot_open_location (slot, downloads, 0);
+    g_object_unref (downloads);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+on_drop_slot_location_changed (GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+    NemoWindowSlot *slot = NEMO_WINDOW_SLOT (object);
+    GFile *location = nemo_window_slot_get_location (slot);
+    GFile *downloads = g_file_new_for_path (g_get_user_special_dir (G_USER_DIRECTORY_DOWNLOAD));
+    
+    /* If the user accidentally navigates away, instantly bounce back to Downloads */
+    if (location != NULL && !g_file_equal (location, downloads)) {
+        g_idle_add (reset_downloads_location_idle, slot);
+    }
+    
+    if (location) g_object_unref (location);
+    g_object_unref (downloads);
 }
 
 static void
@@ -428,6 +458,7 @@ nemo_window_set_up_sidebar (NemoWindow *window)
 	gtk_style_context_add_class (gtk_widget_get_style_context (window->details->sidebar),
 				     GTK_STYLE_CLASS_SIDEBAR);
 
+	/* Revert shrink=TRUE to FALSE to stop GTK from crushing the sidebar */
 	gtk_paned_pack1 (GTK_PANED (window->details->content_paned),
 			 GTK_WIDGET (window->details->sidebar),
 			 FALSE, FALSE);
@@ -441,6 +472,11 @@ nemo_window_set_up_sidebar (NemoWindow *window)
     g_signal_connect_object (NEMO_WINDOW (window), "notify::sidebar-view-id",
                              G_CALLBACK (side_pane_id_changed), window, 0);
 
+    /* SPLIT LEFT SIDEBAR VERTICALLY: PLACES (TOP) / THIRD FILE PANE (BOTTOM) */
+    GtkWidget *sidebar_paned = gtk_paned_new (GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start (GTK_BOX (window->details->sidebar), sidebar_paned, TRUE, TRUE, 0);
+    gtk_widget_show (sidebar_paned);
+
     if (g_strcmp0 (window->details->sidebar_id, NEMO_WINDOW_SIDEBAR_PLACES) == 0) {
         sidebar = nemo_places_sidebar_new (window);
     } else if (g_strcmp0 (window->details->sidebar_id, NEMO_WINDOW_SIDEBAR_TREE) == 0) {
@@ -449,8 +485,62 @@ nemo_window_set_up_sidebar (NemoWindow *window)
         g_assert_not_reached ();
     }
 
-	gtk_box_pack_start (GTK_BOX (window->details->sidebar), sidebar, TRUE, TRUE, 0);
-	gtk_widget_show (sidebar);
+    gtk_paned_pack1 (GTK_PANED (sidebar_paned), sidebar, TRUE, FALSE);
+    gtk_widget_show (sidebar);
+
+    /* CREATE DOWNLOADS WRAPPER BOX */
+    GtkWidget *downloads_wrapper = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Add a clean bold label instead of the bulky notebook tab */
+    GtkWidget *downloads_label = gtk_label_new (NULL);
+    gtk_label_set_markup (GTK_LABEL (downloads_label), "<b>Downloads</b>");
+    gtk_widget_set_halign (downloads_label, GTK_ALIGN_START);
+    gtk_widget_set_margin_start (downloads_label, 6);
+    gtk_widget_set_margin_top (downloads_label, 6);
+    gtk_widget_set_margin_bottom (downloads_label, 4);
+    gtk_box_pack_start (GTK_BOX (downloads_wrapper), downloads_label, FALSE, FALSE, 0);
+    gtk_widget_show (downloads_label);
+
+    /* CREATE THE REAL FILE VIEW PANE */
+    NemoWindowPane *drop_pane = nemo_window_pane_new (window);
+    
+    /* Re-add to panes list so Nemo doesn't crash on load */
+    window->details->panes = g_list_append (window->details->panes, drop_pane);
+    
+    /* Tag it so the Alt+M / Alt+C shortcut logic knows to ignore it! */
+    g_object_set_data (G_OBJECT (drop_pane), "is_drop_pane", GINT_TO_POINTER (1));
+
+    gtk_widget_hide (drop_pane->tool_bar);
+
+    NemoWindowSlot *drop_slot = nemo_window_pane_open_slot (drop_pane, 0);
+    drop_pane->active_slot = drop_slot;
+
+    /* Hide the notebook tab entirely */
+    if (drop_pane->notebook != NULL) {
+        gtk_notebook_set_show_tabs (GTK_NOTEBOOK (drop_pane->notebook), FALSE);
+    }
+
+    /* Navigate third pane to ~/Downloads by default */
+    GFile *downloads_dir = g_file_new_for_path (g_build_filename (g_get_home_dir (), "Downloads", NULL));
+    nemo_window_slot_open_location (drop_slot, downloads_dir, 0);
+    g_signal_connect (drop_slot, "notify::location", G_CALLBACK (on_drop_slot_location_changed), NULL);
+    g_object_unref (downloads_dir);
+
+    /* CRITICAL FIX FOR WIDTH: Wrap the drop_pane in a scrolled window.
+     * This acts as a shock absorber so the long filenames cannot force the sidebar to be wide! */
+    GtkWidget *drop_scroll = gtk_scrolled_window_new (NULL, NULL);
+    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (drop_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+    gtk_container_add (GTK_CONTAINER (drop_scroll), GTK_WIDGET (drop_pane));
+    gtk_widget_show (GTK_WIDGET (drop_pane));
+
+    gtk_box_pack_start (GTK_BOX (downloads_wrapper), drop_scroll, TRUE, TRUE, 0);
+    gtk_widget_show (drop_scroll);
+
+    /* Pack wrapper safely */
+    gtk_widget_set_size_request (downloads_wrapper, 150, 180);
+    gtk_paned_pack2 (GTK_PANED (sidebar_paned), downloads_wrapper, FALSE, FALSE);
+    gtk_widget_show (downloads_wrapper);
+
 	gtk_widget_show (GTK_WIDGET (window->details->sidebar));
 }
 
@@ -602,6 +692,20 @@ on_menu_selection_done (GtkMenuShell *menushell,
 }
 
 static void
+on_preview_paned_map_center_split (GtkWidget *paned, gpointer user_data)
+{
+	GtkAllocation alloc;
+	gtk_widget_get_allocation (paned, &alloc);
+
+	if (alloc.width > 200) {
+		gtk_paned_set_position (GTK_PANED (paned), alloc.width / 2);
+	}
+
+	/* Disconnect handler after initial rendering so the user can manually drag if desired */
+	g_signal_handlers_disconnect_by_func (paned, G_CALLBACK (on_preview_paned_map_center_split), user_data);
+}
+
+static void
 nemo_window_constructed (GObject *self)
 {
 	NemoWindow *window;
@@ -680,6 +784,11 @@ nemo_window_constructed (GObject *self)
 
 	window->details->toolbar_holder = toolbar_holder;
 
+	/* Force Dark Theme globally and use standard GTK icon lookup */
+	g_object_set (gtk_settings_get_default (),
+	              "gtk-application-prefer-dark-theme", TRUE,
+	              NULL);
+
 	/* Register to menu provider extension signal managing menu updates */
 	g_signal_connect_object (nemo_signaller_get_current (), "popup_menu_changed",
 			 G_CALLBACK (nemo_window_load_extension_menus), window, G_CONNECT_SWAPPED);
@@ -692,11 +801,69 @@ nemo_window_constructed (GObject *self)
 	gtk_widget_show (window->details->content_paned);
 
 	vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-	gtk_paned_pack2 (GTK_PANED (window->details->content_paned), vbox,
-			 TRUE, FALSE);
+
+	/* WRAP VBOX IN A NEW HORIZONTAL PANED FOR THE PREVIEW PANEL */
+	GtkWidget *preview_paned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
+	gtk_widget_show (preview_paned);
+
+	/* Attach preview_paned to right side of content_paned */
+	gtk_paned_pack2 (GTK_PANED (window->details->content_paned), preview_paned, TRUE, FALSE);
+
+	/* 1. CREATE PREVIEW CONTAINER AS A VERTICAL SPLIT */
+	GtkWidget *preview_vbox = gtk_paned_new (GTK_ORIENTATION_VERTICAL);
+	gtk_widget_set_margin_top (preview_vbox, 6);
+	gtk_widget_set_margin_bottom (preview_vbox, 6);
+	gtk_widget_set_margin_end (preview_vbox, 6);
+
+	/* IMAGE/PDF PREVIEW WIDGET (Top half, scrollable for multi-page) */
+	GtkWidget *image_scroll = gtk_scrolled_window_new (NULL, NULL);
+	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (image_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+	gtk_paned_pack1 (GTK_PANED (preview_vbox), image_scroll, TRUE, FALSE);
+
+	GtkWidget *multi_image_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 10);
+	gtk_widget_set_halign (multi_image_box, GTK_ALIGN_FILL);
+	gtk_widget_set_valign (multi_image_box, GTK_ALIGN_FILL);
+	gtk_widget_set_hexpand (multi_image_box, TRUE);
+	gtk_widget_set_vexpand (multi_image_box, TRUE);
+	gtk_container_add (GTK_CONTAINER (image_scroll), multi_image_box);
+	gtk_widget_show (multi_image_box);
+
+	/* TEXT CONTENT PREVIEW WIDGET (Bottom half, selectable text) */
+	GtkWidget *preview_scroll = gtk_scrolled_window_new (NULL, NULL);
+	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (preview_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+	gtk_paned_pack2 (GTK_PANED (preview_vbox), preview_scroll, TRUE, FALSE);
+
+	GtkWidget *preview_text = gtk_text_view_new ();
+	gtk_text_view_set_editable (GTK_TEXT_VIEW (preview_text), FALSE);
+	gtk_text_view_set_cursor_visible (GTK_TEXT_VIEW (preview_text), TRUE);
+	gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (preview_text), GTK_WRAP_WORD_CHAR);
+	gtk_widget_show (preview_text);
+	gtk_container_add (GTK_CONTAINER (preview_scroll), preview_text);
+
+	/* Set a default 50/50 vertical split for the preview pane */
+	gtk_paned_set_position (GTK_PANED (preview_vbox), 400);
+
+	/* STORE WIDGET POINTERS GLOBALLY SO WE CAN UPDATE THEM LATER */
+	g_object_set_data (G_OBJECT (window), "custom_preview_image_box", multi_image_box);
+	g_object_set_data (G_OBJECT (window), "custom_preview_text", preview_text);
+	gtk_widget_show (preview_vbox);
+	gtk_widget_show (image_scroll);
+	gtk_widget_show (preview_scroll);
+
+	/* 2. PACK BOTH PANES WITH resize=TRUE and shrink=FALSE FOR EVEN 50/50 EXPANSION */
+	gtk_paned_pack1 (GTK_PANED (preview_paned), vbox, TRUE, FALSE);
+	gtk_paned_pack2 (GTK_PANED (preview_paned), preview_vbox, TRUE, FALSE);
+
+	/* Set 250px safety floors so small window sizes do not crush either pane */
+	gtk_widget_set_size_request (vbox, 250, -1);
+	gtk_widget_set_size_request (preview_vbox, 250, -1);
+
+	/* Connect one-shot map handler to calculate and set the exact 50% midpoint handle position on render */
+	g_signal_connect (preview_paned, "map", G_CALLBACK (on_preview_paned_map_center_split), NULL);
+
 	gtk_widget_show (vbox);
 
-	hpaned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
+	hpaned = gtk_paned_new (GTK_ORIENTATION_VERTICAL);
 	gtk_box_pack_start (GTK_BOX (vbox), hpaned, TRUE, TRUE, 0);
 	gtk_widget_show (hpaned);
 	window->details->split_view_hpane = hpaned;
@@ -1667,18 +1834,25 @@ nemo_window_get_next_pane (NemoWindow *window)
        NemoWindowPane *next_pane;
        GList *node;
 
-       /* return NULL if there is only one pane */
        if (!window->details->panes || !window->details->panes->next) {
 	       return NULL;
        }
 
-       /* get next pane in the (wrapped around) list */
        node = g_list_find (window->details->panes, window->details->active_pane);
        g_return_val_if_fail (node, NULL);
-       if (node->next) {
-	       next_pane = node->next->data;
-       } else {
-	       next_pane =  window->details->panes->data;
+       
+       /* Loop to find the next pane, explicitly skipping our custom Downloads drop zone */
+       do {
+           if (node->next) {
+               node = node->next;
+           } else {
+               node = window->details->panes;
+           }
+           next_pane = node->data;
+       } while (g_object_get_data (G_OBJECT (next_pane), "is_drop_pane") != NULL && next_pane != window->details->active_pane);
+
+       if (next_pane == window->details->active_pane) {
+           return NULL; /* No other valid targets */
        }
 
        return next_pane;
@@ -1774,23 +1948,24 @@ nemo_window_get_extra_slot (NemoWindow *window)
 
 	g_assert (NEMO_IS_WINDOW (window));
 
-
-	/* return NULL if there is only one pane */
-	if (window->details->panes == NULL ||
-	    window->details->panes->next == NULL) {
+	if (window->details->panes == NULL || window->details->panes->next == NULL) {
 		return NULL;
 	}
 
-	/* get next pane in the (wrapped around) list */
-	node = g_list_find (window->details->panes,
-			    window->details->active_pane);
-	g_return_val_if_fail (node, FALSE);
+	node = g_list_find (window->details->panes, window->details->active_pane);
+	g_return_val_if_fail (node, NULL);
 
-	if (node->next) {
-		extra_pane = node->next->data;
-	}
-	else {
-		extra_pane =  window->details->panes->data;
+	do {
+		if (node->next) {
+			node = node->next;
+		} else {
+			node = window->details->panes;
+		}
+		extra_pane = node->data;
+	} while (g_object_get_data (G_OBJECT (extra_pane), "is_drop_pane") != NULL && extra_pane != window->details->active_pane);
+
+	if (extra_pane == window->details->active_pane) {
+		return NULL;
 	}
 
 	return extra_pane->active_slot;
@@ -2523,11 +2698,11 @@ nemo_window_split_view_off (NemoWindow *window)
 
 	active_pane = nemo_window_get_active_pane (window);
 
-	/* delete all panes except the first (main) pane */
+	/* delete all panes except the first (main) pane and our drop pane */
 	for (l = window->details->panes; l != NULL; l = next) {
 		next = l->next;
 		pane = l->data;
-		if (pane != active_pane) {
+		if (pane != active_pane && g_object_get_data (G_OBJECT (pane), "is_drop_pane") == NULL) {
             g_clear_object (&window->details->secondary_pane_last_location);
             window->details->secondary_pane_last_location = nemo_window_slot_get_location (pane->active_slot);
 			nemo_window_close_pane (window, pane);

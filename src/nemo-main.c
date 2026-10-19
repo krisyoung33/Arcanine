@@ -51,6 +51,8 @@
 #include <exempi/xmp.h>
 #endif
 
+#include <evince-document.h>
+
 int
 main (int argc, char *argv[])
 {
@@ -76,6 +78,10 @@ main (int argc, char *argv[])
 #ifdef HAVE_EXEMPI
 	xmp_init();
 #endif
+
+	if (!ev_init ()) {
+		g_warning ("Failed to initialize Evince document backend.");
+	}
 
 	/* Run the nemo application. */
 	application = nemo_main_application_get_singleton ();

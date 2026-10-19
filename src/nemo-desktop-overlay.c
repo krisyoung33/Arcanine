@@ -497,7 +497,7 @@ nemo_desktop_overlay_init (NemoDesktopOverlay *overlay)
 
     gtk_container_child_set (GTK_CONTAINER (priv->stack),
                              prefs_box,
-                             "icon-name", "xsi-tools-symbolic",
+                             "icon-name", "tools-symbolic",
                              NULL);
 
     priv->view_substack = GTK_STACK (gtk_builder_get_object (priv->builder, "view_substack"));

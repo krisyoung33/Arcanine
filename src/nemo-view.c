@@ -88,6 +88,8 @@
 #include <libnemo-private/nemo-trash-monitor.h>
 #include <libnemo-private/nemo-ui-utilities.h>
 #include <libnemo-private/nemo-signaller.h>
+#include <evince-document.h>
+#include <evince-view.h>
 #include <libnemo-private/nemo-icon-names.h>
 #include <libnemo-private/nemo-file-undo-manager.h>
 #include <libnemo-private/nemo-action.h>
@@ -3268,17 +3270,154 @@ nemo_view_display_selection_info (NemoView *view)
 	g_free (non_folder_str);
 
 	if (status_string == NULL) {
-		status_string = g_strdup (view_status_string);
-	}
+        status_string = g_strdup (view_status_string);
+    }
 
     nemo_window_slot_set_status (view->details->slot,
                                  status_string,
                                  view_status_string,
                                  view->details->loading);
 
-	g_free (status_string);
-	g_free (view_status_string);
+    g_free (status_string);
+    g_free (view_status_string);
+
+    /* --- INJECT CUSTOM PREVIEW LOGIC --- */
+    GtkWidget *multi_image_box = NULL;
+    GtkWidget *preview_text = NULL;
+    NemoWindow *window = nemo_window_slot_get_window (view->details->slot);
+
+    if (window != NULL) {
+        multi_image_box = g_object_get_data (G_OBJECT (window), "custom_preview_image_box");
+        preview_text = g_object_get_data (G_OBJECT (window), "custom_preview_text");
+    }
+
+    if (multi_image_box != NULL && preview_text != NULL) {
+        GList *current_selection = nemo_view_get_selection (view);
+        GtkWidget *image_scroll = gtk_widget_get_parent (multi_image_box);
+        GtkWidget *text_scroll = gtk_widget_get_parent (preview_text);
+        
+        /* Clear existing images */
+        GList *children, *iter;
+        children = gtk_container_get_children (GTK_CONTAINER (multi_image_box));
+        for (iter = children; iter != NULL; iter = g_list_next (iter)) {
+            gtk_widget_destroy (GTK_WIDGET (iter->data));
+        }
+        g_list_free (children);
+
+        if (g_list_length (current_selection) == 1) {
+            NemoFile *selected_file = NEMO_FILE (current_selection->data);
+            GFile *gfile = nemo_file_get_location (selected_file);
+            char *path = g_file_get_path (gfile);
+            
+            GtkTextBuffer *buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (preview_text));
+            
+            /* 1. Handle Plain Text Content (Read file, hide image) */
+            if (nemo_file_is_mime_type (selected_file, "text/plain")) {
+                gtk_widget_hide (image_scroll);
+                gtk_widget_show (text_scroll);
+                
+                if (path != NULL) {
+                    gchar *contents = NULL;
+                    gsize length;
+                    if (g_file_get_contents (path, &contents, &length, NULL)) {
+                        if (length > 10000) contents[10000] = '\0';
+                        gtk_text_buffer_set_text (buffer, contents, -1);
+                        g_free (contents);
+                    } else {
+                        gtk_text_buffer_set_text (buffer, "Could not read text file contents.", -1);
+                    }
+                }
+            } 
+            /* 2. Handle PDF Documents via Evince (Native selection and zoom) */
+            else if (nemo_file_is_mime_type (selected_file, "application/pdf") && path != NULL) {
+                gtk_widget_show (image_scroll);
+                gtk_widget_hide (text_scroll); /* EvView handles text natively, bottom pane not needed */
+                
+                GError *err = NULL;
+                char *file_uri = g_filename_to_uri (path, NULL, NULL);
+                EvDocument *document = ev_document_factory_get_document (file_uri, &err);
+                g_free (file_uri);
+                
+                if (document != NULL) {
+                    EvDocumentModel *model = ev_document_model_new_with_document (document);
+                    GtkWidget *ev_view = ev_view_new ();
+                    
+                    ev_view_set_model (EV_VIEW (ev_view), model);
+                    
+                    /* Set continuous scrolling and fit to width */
+                    ev_document_model_set_continuous (model, TRUE);
+                    ev_document_model_set_sizing_mode (model, EV_SIZING_FIT_WIDTH);
+                    
+                    /* EvView requires a GtkScrolledWindow parent */
+                    GtkWidget *ev_scroll = gtk_scrolled_window_new (NULL, NULL);
+                    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (ev_scroll),
+                                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+                    gtk_container_add (GTK_CONTAINER (ev_scroll), ev_view);
+                    gtk_widget_set_halign (ev_scroll, GTK_ALIGN_FILL);
+                    gtk_widget_set_hexpand (ev_scroll, TRUE);
+                    gtk_widget_set_vexpand (ev_scroll, TRUE);
+                    gtk_widget_show (ev_view);
+                    gtk_widget_show (ev_scroll);
+                    gtk_box_pack_start (GTK_BOX (multi_image_box), ev_scroll, TRUE, TRUE, 0);
+                    
+                    g_object_unref (model);
+                    g_object_unref (document);
+                } else {
+                    if (err) g_error_free (err);
+                    GtkWidget *img = gtk_image_new_from_icon_name ("application-pdf", GTK_ICON_SIZE_DIALOG);
+                    gtk_widget_show (img);
+                    gtk_box_pack_start (GTK_BOX (multi_image_box), img, FALSE, FALSE, 0);
+                }
+            }
+            /* 3. Handle Images (Hide text, scale large) */
+            else if (nemo_file_is_mime_type (selected_file, "image/*") && path != NULL) {
+                gtk_widget_hide (text_scroll);
+                gtk_widget_show (image_scroll);
+                
+                GError *err = NULL;
+                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale (path, 800, 1000, TRUE, &err);
+                GtkWidget *img;
+                if (pixbuf != NULL) {
+                    img = gtk_image_new_from_pixbuf (pixbuf);
+                    g_object_unref (pixbuf);
+                } else {
+                    if (err) g_error_free (err);
+                    img = gtk_image_new_from_icon_name ("image-x-generic", GTK_ICON_SIZE_DIALOG);
+                }
+                gtk_widget_show (img);
+                gtk_box_pack_start (GTK_BOX (multi_image_box), img, FALSE, FALSE, 0);
+            }
+            /* 4. Fallback for other files (Show generic icon, hide text) */
+            else {
+                gtk_widget_hide (text_scroll);
+                gtk_widget_show (image_scroll);
+                
+                GIcon *gicon = nemo_file_get_gicon (selected_file, NEMO_FILE_ICON_FLAGS_NONE);
+                GtkWidget *img;
+                if (gicon != NULL) {
+                    img = gtk_image_new_from_gicon (gicon, GTK_ICON_SIZE_DIALOG);
+                    g_object_unref (gicon);
+                } else {
+                    img = gtk_image_new_from_icon_name ("text-x-generic", GTK_ICON_SIZE_DIALOG);
+                }
+                gtk_widget_show (img);
+                gtk_box_pack_start (GTK_BOX (multi_image_box), img, FALSE, FALSE, 0);
+            }
+
+            if (path != NULL) g_free (path);
+            
+        } else {
+            /* If 0 or multiple items are selected, clear the preview pane */
+            gtk_widget_hide (image_scroll);
+            gtk_widget_show (text_scroll);
+            GtkTextBuffer *buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (preview_text));
+            gtk_text_buffer_set_text (buffer, "Select a single file to preview.", -1);
+        }
+        
+        nemo_file_list_free (current_selection);
+    }
 }
+    /* --- END CUSTOM PREVIEW LOGIC --- */
 
 static void
 nemo_view_send_selection_change (NemoView *view)
@@ -8344,21 +8483,21 @@ nemo_view_init_show_hidden_files (NemoView *view)
 }
 
 static const GtkActionEntry directory_view_entries[] = {
-  /* name, stock id, label */  { "New Documents", "xsi-document-new-symbolic", N_("Create New _Document") },
+  /* name, stock id, label */  { "New Documents", "document-new-symbolic", N_("Create New _Document") },
   /* name, stock id, label */  { "Open With", NULL, N_("Open Wit_h"),
 				 NULL, N_("Choose a program with which to open the selected item") },
-  /* name, stock id */         { "Properties", "xsi-document-properties-symbolic",
+  /* name, stock id */         { "Properties", "document-properties-symbolic",
   /* label, accelerator */       N_("_Properties"), "<alt>Return",
   /* tooltip */                  N_("View or modify the properties of each selected item"),
 				 G_CALLBACK (action_properties_callback) },
   /* name, stock id */         { "PropertiesAccel", NULL,
   /* label, accelerator */       "PropertiesAccel", "<control>I",
   /* tooltip */                  NULL,
-				 G_CALLBACK (action_properties_callback) },
-  /* name, stock id */         { "New Folder", "xsi-folder-new-symbolic",
-  /* label, accelerator */       N_("Create New _Folder"), "<control><shift>N",
+                 G_CALLBACK (action_properties_callback) },
+  /* name, stock id */         { "New Folder", "folder-new-symbolic",
+  /* label, accelerator */       N_("Create New _Folder"), "F7",
   /* tooltip */                  N_("Create a new empty folder inside this folder"),
-				 G_CALLBACK (action_new_folder_callback) },
+                 G_CALLBACK (action_new_folder_callback) },
   /* name, stock id, label */  { "No Templates", NULL, N_("No templates installed") },
   /* name, stock id */         { "New Empty Document", NULL,
     /* translators: this is used to indicate that a document doesn't contain anything */
@@ -8381,20 +8520,20 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("Open in New _Tab"), "<control><shift>t",
   /* tooltip */                  N_("Open each selected item in a new tab"),
 				 G_CALLBACK (action_open_new_tab_callback) },
-  /* name, stock id */         { NEMO_ACTION_OPEN_IN_TERMINAL, "xsi-utilities-terminal-symbolic",
+  /* name, stock id */         { NEMO_ACTION_OPEN_IN_TERMINAL, "utilities-terminal-symbolic",
   /* label, accelerator */       N_("Open in Terminal"), "<shift>F4",
   /* tooltip */                  N_("Open terminal in the selected folder"),
 				 G_CALLBACK (action_open_in_terminal_callback) },
-  /* name, stock id */         { NEMO_ACTION_OPEN_AS_ROOT, "xsi-dialog-password-symbolic",
+  /* name, stock id */         { NEMO_ACTION_OPEN_AS_ROOT, "dialog-password-symbolic",
   /* label, accelerator */       N_("Open as Root"), "",
   /* tooltip */                  N_("Open the folder with administration privileges"),
 				 G_CALLBACK (action_open_as_root_callback) },
 
-  /* name, stock id */         { NEMO_ACTION_FOLLOW_SYMLINK, "xsi-go-jump-symbolic",
+  /* name, stock id */         { NEMO_ACTION_FOLLOW_SYMLINK, "go-jump-symbolic",
   /* label, accelerator */       N_("Follow link to original file"), "",
   /* tooltip */                  N_("Navigate to the original file that this symbolic link points to"),
                  G_CALLBACK (action_follow_symlink_callback) },
-  /* name, stock id */         { NEMO_ACTION_OPEN_CONTAINING_FOLDER, "xsi-go-jump-symbolic",
+  /* name, stock id */         { NEMO_ACTION_OPEN_CONTAINING_FOLDER, "go-jump-symbolic",
   /* label, accelerator */       N_("Open containing folder"), "<control><alt>O",
   /* tooltip */                  N_("Navigate to the folder that the selected item is stored in"),
                  G_CALLBACK (action_open_containing_folder_callback) },
@@ -8410,21 +8549,21 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("E_mpty Trash"), NULL,
   /* tooltip */                  N_("Delete all items in the Trash"),
 				 G_CALLBACK (action_empty_trash_callback) },
-  /* name, stock id */         { "Cut", "xsi-edit-cut-symbolic",
+  /* name, stock id */         { "Cut", "edit-cut-symbolic",
   /* label, accelerator */       N_("Cu_t"), "<control>X",
   /* tooltip */                  N_("Prepare the selected files to be moved with a Paste command"),
 				 G_CALLBACK (action_cut_files_callback) },
-  /* name, stock id */         { "Copy", "xsi-edit-copy-symbolic",
+  /* name, stock id */         { "Copy", "edit-copy-symbolic",
   /* label, accelerator */       N_("_Copy"), "<control>C",
   /* tooltip */                  N_("Prepare the selected files to be copied with a Paste command"),
 				 G_CALLBACK (action_copy_files_callback) },
-  /* name, stock id */         { "Paste", "xsi-edit-paste-symbolic",
+  /* name, stock id */         { "Paste", "edit-paste-symbolic",
   /* label, accelerator */       N_("_Paste"), "<control>V",
   /* tooltip */                  N_("Move or copy files previously selected by a Cut or Copy command"),
 				 G_CALLBACK (action_paste_files_callback) },
   /* We make accelerator "" instead of null here to not inherit the stock
      accelerator for paste */
-  /* name, stock id */         { "Paste Files Into", "xsi-edit-paste-symbolic",
+  /* name, stock id */         { "Paste Files Into", "edit-paste-symbolic",
   /* label, accelerator */       N_("_Paste Into Folder"), "",
   /* tooltip */                  N_("Move or copy files previously selected by a Cut or Copy command into the selected folder"),
 				 G_CALLBACK (action_paste_files_into_callback) },
@@ -8470,11 +8609,11 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("_Restore to original location"), NULL,
 				 NULL,
                  G_CALLBACK (action_restore_from_trash_callback) },
- /* name, stock id */          { "Undo", "xsi-edit-undo-symbolic",
+ /* name, stock id */          { "Undo", "edit-undo-symbolic",
  /* label, accelerator */        N_("_Undo"), "<control>Z",
  /* tooltip */                   N_("Undo the last action"),
                                  G_CALLBACK (action_undo_callback) },
- /* name, stock id */	       { "Redo", "xsi-edit-redo-symbolic",
+ /* name, stock id */	       { "Redo", "edit-redo-symbolic",
  /* label, accelerator */        N_("_Redo"), "<control>Y",
  /* tooltip */                   N_("Redo the last undone action"),
                                  G_CALLBACK (action_redo_callback) },
@@ -8492,15 +8631,15 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("Connect To This Server"), NULL,
   /* tooltip */                  N_("Make a permanent connection to this server"),
 				 G_CALLBACK (action_connect_to_server_link_callback) },
-  /* name, stock id */         { "Mount Volume", "xsi-media-mount-symbolic",
+  /* name, stock id */         { "Mount Volume", "media-mount-symbolic",
   /* label, accelerator */       N_("_Mount"), NULL,
   /* tooltip */                  N_("Mount the selected volume"),
 				 G_CALLBACK (action_mount_volume_callback) },
-  /* name, stock id */         { "Unmount Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Unmount Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Unmount"), NULL,
   /* tooltip */                  N_("Unmount the selected volume"),
 				 G_CALLBACK (action_unmount_volume_callback) },
-  /* name, stock id */         { "Eject Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Eject Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Eject"), NULL,
   /* tooltip */                  N_("Eject the selected volume"),
 				 G_CALLBACK (action_eject_volume_callback) },
@@ -8516,15 +8655,15 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("_Detect Media"), NULL,
   /* tooltip */                  N_("Detect media in the selected drive"),
 				 G_CALLBACK (action_detect_media_callback) },
-  /* name, stock id */         { "Self Mount Volume", "xsi-media-mount-symbolic",
+  /* name, stock id */         { "Self Mount Volume", "media-mount-symbolic",
   /* label, accelerator */       N_("_Mount"), NULL,
   /* tooltip */                  N_("Mount the volume associated with the open folder"),
 				 G_CALLBACK (action_self_mount_volume_callback) },
-  /* name, stock id */         { "Self Unmount Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Self Unmount Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Unmount"), NULL,
   /* tooltip */                  N_("Unmount the volume associated with the open folder"),
 				 G_CALLBACK (action_self_unmount_volume_callback) },
-  /* name, stock id */         { "Self Eject Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Self Eject Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Eject"), NULL,
   /* tooltip */                  N_("Eject the volume associated with the open folder"),
 				 G_CALLBACK (action_self_eject_volume_callback) },
@@ -8550,15 +8689,15 @@ static const GtkActionEntry directory_view_entries[] = {
   /* tooltip */                  N_("Open this folder in a new tab"),
 				 G_CALLBACK (action_location_open_in_new_tab_callback) },
 
-  /* name, stock id */         { NEMO_ACTION_LOCATION_CUT, "xsi-edit-cut-symbolic",
+  /* name, stock id */         { NEMO_ACTION_LOCATION_CUT, "edit-cut-symbolic",
   /* label, accelerator */       N_("Cu_t"), "",
   /* tooltip */                  N_("Prepare this folder to be moved with a Paste command"),
 				 G_CALLBACK (action_location_cut_callback) },
-  /* name, stock id */         { NEMO_ACTION_LOCATION_COPY, "xsi-edit-copy-symbolic",
+  /* name, stock id */         { NEMO_ACTION_LOCATION_COPY, "edit-copy-symbolic",
   /* label, accelerator */       N_("_Copy"), "",
   /* tooltip */                  N_("Prepare this folder to be copied with a Paste command"),
 				 G_CALLBACK (action_location_copy_callback) },
-  /* name, stock id */         { NEMO_ACTION_LOCATION_PASTE_FILES_INTO, "xsi-edit-paste-symbolic",
+  /* name, stock id */         { NEMO_ACTION_LOCATION_PASTE_FILES_INTO, "edit-paste-symbolic",
   /* label, accelerator */       N_("_Paste Into Folder"), "",
   /* tooltip */                  N_("Move or copy files previously selected by a Cut or Copy command into this folder"),
 				 G_CALLBACK (action_location_paste_files_into_callback) },
@@ -8575,15 +8714,15 @@ static const GtkActionEntry directory_view_entries[] = {
   /* label, accelerator */       N_("_Restore to original location"), NULL, NULL,
 				 G_CALLBACK (action_location_restore_from_trash_callback) },
 
-  /* name, stock id */         { "Location Mount Volume", "xsi-media-mount-symbolic",
+  /* name, stock id */         { "Location Mount Volume", "media-mount-symbolic",
   /* label, accelerator */       N_("_Mount"), NULL,
   /* tooltip */                  N_("Mount the volume associated with this folder"),
 				 G_CALLBACK (action_location_mount_volume_callback) },
-  /* name, stock id */         { "Location Unmount Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Location Unmount Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Unmount"), NULL,
   /* tooltip */                  N_("Unmount the volume associated with this folder"),
 				 G_CALLBACK (action_location_unmount_volume_callback) },
-  /* name, stock id */         { "Location Eject Volume", "xsi-media-eject-symbolic",
+  /* name, stock id */         { "Location Eject Volume", "media-eject-symbolic",
   /* label, accelerator */       N_("_Eject"), NULL,
   /* tooltip */                  N_("Eject the volume associated with this folder"),
 				 G_CALLBACK (action_location_eject_volume_callback) },
@@ -8600,17 +8739,17 @@ static const GtkActionEntry directory_view_entries[] = {
   /* tooltip */                  N_("Detect media in the selected drive"),
 				 G_CALLBACK (action_location_detect_media_callback) },
 
-  /* name, stock id */         { "LocationProperties", "xsi-document-properties-symbolic",
+  /* name, stock id */         { "LocationProperties", "document-properties-symbolic",
   /* label, accelerator */       N_("_Properties"), NULL,
   /* tooltip */                  N_("View or modify the properties of this folder"),
 				 G_CALLBACK (action_location_properties_callback) },
 
   /* name, stock id, label */  {NEMO_ACTION_COPY_TO_NEXT_PANE, NULL, N_("_Other pane"),
-				NULL, N_("Copy the current selection to the other pane in the window"),
-				G_CALLBACK (action_copy_to_next_pane_callback) },
+                "<alt>c", N_("Copy the current selection to the other pane in the window"),
+                G_CALLBACK (action_copy_to_next_pane_callback) },
   /* name, stock id, label */  {NEMO_ACTION_MOVE_TO_NEXT_PANE, NULL, N_("_Other pane"),
-				NULL, N_("Move the current selection to the other pane in the window"),
-				G_CALLBACK (action_move_to_next_pane_callback) },
+                "<alt>m", N_("Move the current selection to the other pane in the window"),
+                G_CALLBACK (action_move_to_next_pane_callback) },
   /* name, stock id, label */  {NEMO_ACTION_COPY_TO_HOME, NULL,
 				N_("_Home"), NULL,
 				N_("Copy the current selection to the home folder"),
@@ -8627,27 +8766,27 @@ static const GtkActionEntry directory_view_entries[] = {
 				N_("_Desktop"), NULL,
 				N_("Move the current selection to the desktop"),
 				G_CALLBACK (action_move_to_desktop_callback) },
-                               {NEMO_ACTION_BROWSE_MOVE_TO, "xsi-document-open-symbolic",
+                               {NEMO_ACTION_BROWSE_MOVE_TO, "document-open-symbolic",
                 N_("Browse..."), NULL,
                 N_("Browse for a folder to move the selection to"),
                 G_CALLBACK (action_browse_for_move_to_folder_callback) },
-                               {NEMO_ACTION_BROWSE_COPY_TO, "xsi-document-open-symbolic",
+                               {NEMO_ACTION_BROWSE_COPY_TO, "document-open-symbolic",
                 N_("Browse..."), NULL,
                 N_("Browse for a folder to copy the selection to"),
                 G_CALLBACK (action_browse_for_copy_to_folder_callback) },
-                               {NEMO_ACTION_PIN_FILE, "xsi-pin-symbolic",
+                               {NEMO_ACTION_PIN_FILE, "pin-symbolic",
                 N_("P_in"), "<control><shift>D",
                 N_("Pin the selected file so it always appears at the top of this location's file list"),
                 G_CALLBACK (action_pin_unpin_file_callback) },
-                               {NEMO_ACTION_UNPIN_FILE, "xsi-unpin-symbolic",
+                               {NEMO_ACTION_UNPIN_FILE, "unpin-symbolic",
                 N_("Unp_in"), "<control><shift>D",
                 N_("Unpin the selected file from the top of this location's file list"),
                 G_CALLBACK (action_pin_unpin_file_callback) },
-                               {NEMO_ACTION_FAVORITE_FILE, "xsi-favorite-symbolic",
+                               {NEMO_ACTION_FAVORITE_FILE, "favorite-symbolic",
                 N_("Add to favorites"), NULL,
                 N_("Add the selected file to your favorites"),
                 G_CALLBACK (action_favorite_unfavorite_file_callback) },
-                               {NEMO_ACTION_UNFAVORITE_FILE, "xsi-unfavorite-symbolic",
+                               {NEMO_ACTION_UNFAVORITE_FILE, "unfavorite-symbolic",
                 N_("Remove from favorites"), NULL,
                 N_("Remove the selected file from your favorites"),
                 G_CALLBACK (action_favorite_unfavorite_file_callback) }
@@ -9884,7 +10023,7 @@ real_update_menus (NemoView *view)
 	}
 
     if (app_icon == NULL) {
-        app_icon = g_themed_icon_new ("xsi-folder-open-symbolic");
+        app_icon = g_themed_icon_new ("folder-open-symbolic");
     }
 
     action = gtk_action_group_get_action (view->details->dir_action_group,

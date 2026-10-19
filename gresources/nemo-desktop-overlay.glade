@@ -896,7 +896,7 @@
               </object>
               <packing>
                 <property name="name">view</property>
-                <property name="icon_name">xsi-display-symbolic</property>
+                <property name="icon_name">display-symbolic</property>
               </packing>
             </child>
           </object>

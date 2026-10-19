@@ -103,8 +103,12 @@ if enableEmptyView
   nemoCommon_sources += 'nemo-empty-view.c'
 endif
 
+evince_view_dep = dependency('evince-view-3.0', version: '>= 3.0.0')
+evince_document_dep = dependency('evince-document-3.0', version: '>= 3.0.0')
+
 nemo_deps = [ cinnamon, gail, glib, gtk, math,
-  egg, nemo_extension, nemo_private, xapp ]
+  egg, nemo_extension, nemo_private, xapp,
+  evince_view_dep, evince_document_dep ]
 
 if exempi_enabled
   nemo_deps += exempi

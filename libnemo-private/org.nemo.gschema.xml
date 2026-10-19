@@ -535,7 +535,7 @@
       <description>Default zoom level used by the list view.</description>
     </key>
     <key name="default-visible-columns" type="as">
-      <default>[ 'name', 'size', 'type', 'date_modified' ]</default>
+      <default>['name', 'date_modified']</default>
       <summary>Default list of columns visible in the list view</summary>
       <description>Default list of columns visible in the list view.</description>
     </key>
