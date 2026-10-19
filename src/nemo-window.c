@@ -551,6 +551,17 @@ nemo_window_tear_down_sidebar (NemoWindow *window)
 
     g_signal_handlers_disconnect_by_func (NEMO_WINDOW (window), side_pane_id_changed, window);
 
+	/* Close the Downloads drop pane first. It lives inside the sidebar, so
+	 * destroying the sidebar would dispose it while it still has slots. */
+	GList *drop_panes = g_list_copy (window->details->panes);
+	GList *dp;
+	for (dp = drop_panes; dp != NULL; dp = dp->next) {
+		if (g_object_get_data (G_OBJECT (dp->data), "is_drop_pane") != NULL) {
+			nemo_window_close_pane (window, NEMO_WINDOW_PANE (dp->data));
+		}
+	}
+	g_list_free (drop_panes);
+
 	if (window->details->sidebar != NULL) {
 		gtk_widget_destroy (GTK_WIDGET (window->details->sidebar));
 		window->details->sidebar = NULL;
