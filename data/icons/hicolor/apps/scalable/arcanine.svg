@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Arcanine</title>
+  <g fill="none" stroke="#8cd0d3" stroke-width="30" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="67" y="40" width="378" height="432" rx="36"/>
+    <line x1="67" y1="256" x2="445" y2="256"/>
+    <rect x="202" y="131" width="108" height="34" rx="17"/>
+    <rect x="202" y="347" width="108" height="34" rx="17"/>
+  </g>
+</svg>
